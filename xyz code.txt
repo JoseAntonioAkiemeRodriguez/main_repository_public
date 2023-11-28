@@ -1,0 +1,98 @@
+%py
+## Importing the excel spreadsheet xyz_billing into the default schema of the hive_metastore catalog.
+source_df=spark.sql("select distinct date,amount,customerID from hive_metastore.default.xyz_billing where itemDescription='annual subscription'").collect()
+
+#####  1.  Date Table. This date table will be used as a template and will hold only end of the month dates. 
+
+
+## Defining a Date range for the date table.
+import pandas as pd
+start_date='2021-01-01'
+end_date='2024-08-31'
+
+## Function to determine weather a date is an end-of-the month date. Returns a boolean.
+def is_month_end_funct(ts):
+    freq = pd.offsets.Hour(5)
+    return freq.is_month_end(ts)
+
+## Function to create a date table. Returns a pandas df. 
+def create_date_table(start_date,end_date):
+    df = pd.DataFrame({"date": pd.date_range(start_date, end_date)})
+    df["is_month_end"] = list(map(is_month_end_funct, df['date']) )
+    df=df[df.is_month_end==True]
+    df=df.reset_index(drop=True)
+    return df[["date"]]
+
+date_df=create_date_table(start_date,end_date)
+
+
+#####  2. Calculating the 12 MRR for annual subscription based on the annual fee provided and joinning this data set with monthly subscrptions and calendar purchases.  
+
+
+
+## Using a the  date reference table with end of the month dates to as a template to calculate the MRR of annual subscription. Returns a df.
+def annual_subscription(annual_sub_date,amount,customerId):
+    index=date_df[date_df['date']==annual_sub_date].index[0]
+    annual_subscription=create_date_table(date_df.date.loc[index+1],date_df.date.loc[index+12])
+    annual_subscription['amount']=amount/12
+    annual_subscription['customerId']=customerId
+    return annual_subscription
+
+## Creating views, one for each client with an annual subscription.  
+for id in range(len(source_df)):
+    annual_sub_date,amount,customerId=str(source_df[id][0]),source_df[id][1],source_df[id][2]
+    spark.createDataFrame(annual_subscription(annual_sub_date,amount,customerId)).createOrReplaceTempView('temp_view_{0}'.format(id))
+
+## Using dynamic strings for creating a query which joins all views with monthly subscrptions and calendar purchases.
+query=''
+for i in range(len(source_df)):
+    query+="""select customerID,	date(date) as date,	'annual subscription' as itemDescription,	amount, 0 as is_customer_churned  from temp_view_{0} union all """.format(i)
+
+all="""select *, 0 as is_customer_churned from hive_metastore.default.xyz_billing where itemDescription<>'annual subscription'"""
+query=query+all
+spark.sql(query).createOrReplaceTempView("int_xyz_output")
+
+#####  3. Creating a query which calculates which customers are churned and then joining it with the previously created data set.
+spark.createDataFrame(date_df).createOrReplaceTempView("Dates")
+
+final_query="""with ranked_table as (select * except(is_customer_churned), row_number() over (partition by customerID order by date desc) as rank_ from int_xyz_output),
+ranked_joined_table as 
+(select 
+  date(a.`date`) as date, 
+  b.*except(date),
+  row_number() over (partition by b.customerID order by a.date) as rank_
+from
+(select * from Dates) a
+left join
+(select * except (rank_) from ranked_table where rank_=1) b 
+on a.date>=b.date),ranked_filtered_table as (
+select * except(amount,rank_), case when rank_=2 then 0 else amount end as amount,
+case when rank_=2 then 1 else 0 end as is_customer_churned
+from ranked_joined_table where rank_=2
+and customerID is not null)
+
+select date,customerID,itemDescription,amount,is_customer_churned from ranked_filtered_table
+union all
+select date,customerID,itemDescription,amount,is_customer_churned from int_xyz_output
+"""
+spark.sql(final_query).createOrReplaceTempView("xyz_output")
+spark.sql(final_query).display()
+
+---------
+%md 
+Tests 
+1. Does it preserve the total number of customers?
+3. Is the total number of transactions consistent?  
+2. Does the total amount add up? 
+---------
+
+%sql
+--- tests
+select 
+  (select count(distinct customerID) from hive_metastore.default.xyz_billing )==(select count(distinct customerID) from xyz_output) is_n_customers_consistent,
+  sum(amount)==(select sum(amount) from xyz_output) is_total_amount_consistent, 
+  sum(n_transactions)==(select count(*) from xyz_output where is_customer_churned=0) as is_n_transactions_consistent
+from
+(select 
+  *, case when itemDescription = 'annual subscription' then 12 else 1 end as n_transactions 
+from hive_metastore.default.xyz_billing)
